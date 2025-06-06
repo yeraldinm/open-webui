@@ -4,36 +4,40 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import BinaryIO, Tuple, Dict
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from open_webui.config import (
-    S3_ACCESS_KEY_ID,
-    S3_BUCKET_NAME,
-    S3_ENDPOINT_URL,
-    S3_KEY_PREFIX,
-    S3_REGION_NAME,
-    S3_SECRET_ACCESS_KEY,
-    S3_USE_ACCELERATE_ENDPOINT,
-    S3_ADDRESSING_STYLE,
-    S3_ENABLE_TAGGING,
-    GCS_BUCKET_NAME,
-    GOOGLE_APPLICATION_CREDENTIALS_JSON,
-    AZURE_STORAGE_ENDPOINT,
-    AZURE_STORAGE_CONTAINER_NAME,
-    AZURE_STORAGE_KEY,
-    STORAGE_PROVIDER,
-    UPLOAD_DIR,
-)
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError, NotFound
 from open_webui.constants import ERROR_MESSAGES
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 from azure.core.exceptions import ResourceNotFoundError
-from open_webui.env import SRC_LOG_LEVELS
+from open_webui.env import SRC_LOG_LEVELS, DATA_DIR
+
+S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY")
+S3_REGION_NAME = os.environ.get("S3_REGION_NAME")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
+S3_KEY_PREFIX = os.environ.get("S3_KEY_PREFIX")
+S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")
+S3_USE_ACCELERATE_ENDPOINT = os.environ.get("S3_USE_ACCELERATE_ENDPOINT", "false").lower() == "true"
+S3_ADDRESSING_STYLE = os.environ.get("S3_ADDRESSING_STYLE")
+S3_ENABLE_TAGGING = os.getenv("S3_ENABLE_TAGGING", "false").lower() == "true"
+
+GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
+GOOGLE_APPLICATION_CREDENTIALS_JSON = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+
+AZURE_STORAGE_ENDPOINT = os.environ.get("AZURE_STORAGE_ENDPOINT")
+AZURE_STORAGE_CONTAINER_NAME = os.environ.get("AZURE_STORAGE_CONTAINER_NAME")
+AZURE_STORAGE_KEY = os.environ.get("AZURE_STORAGE_KEY")
+
+STORAGE_PROVIDER = os.environ.get("STORAGE_PROVIDER", "local")
+UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", DATA_DIR / "uploads"))
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 log = logging.getLogger(__name__)
@@ -47,7 +51,10 @@ class StorageProvider(ABC):
 
     @abstractmethod
     def upload_file(
-        self, file: BinaryIO, filename: str, tags: Dict[str, str]
+        self,
+        file: BinaryIO,
+        filename: str,
+        tags: Dict[str, str] | None = None,
     ) -> Tuple[bytes, str]:
         pass
 
@@ -63,7 +70,9 @@ class StorageProvider(ABC):
 class LocalStorageProvider(StorageProvider):
     @staticmethod
     def upload_file(
-        file: BinaryIO, filename: str, tags: Dict[str, str]
+        file: BinaryIO,
+        filename: str,
+        tags: Dict[str, str] | None = None,
     ) -> Tuple[bytes, str]:
         contents = file.read()
         if not contents:
@@ -143,7 +152,10 @@ class S3StorageProvider(StorageProvider):
         return re.sub(r"[^a-zA-Z0-9 äöüÄÖÜß\+\-=\._:/@]", "", s)
 
     def upload_file(
-        self, file: BinaryIO, filename: str, tags: Dict[str, str]
+        self,
+        file: BinaryIO,
+        filename: str,
+        tags: Dict[str, str] | None = None,
     ) -> Tuple[bytes, str]:
         """Handles uploading of the file to S3 storage."""
         _, file_path = LocalStorageProvider.upload_file(file, filename, tags)
@@ -236,7 +248,10 @@ class GCSStorageProvider(StorageProvider):
         self.bucket = self.gcs_client.bucket(GCS_BUCKET_NAME)
 
     def upload_file(
-        self, file: BinaryIO, filename: str, tags: Dict[str, str]
+        self,
+        file: BinaryIO,
+        filename: str,
+        tags: Dict[str, str] | None = None,
     ) -> Tuple[bytes, str]:
         """Handles uploading of the file to GCS storage."""
         contents, file_path = LocalStorageProvider.upload_file(file, filename, tags)
@@ -308,7 +323,10 @@ class AzureStorageProvider(StorageProvider):
         )
 
     def upload_file(
-        self, file: BinaryIO, filename: str, tags: Dict[str, str]
+        self,
+        file: BinaryIO,
+        filename: str,
+        tags: Dict[str, str] | None = None,
     ) -> Tuple[bytes, str]:
         """Handles uploading of the file to Azure Blob Storage."""
         contents, file_path = LocalStorageProvider.upload_file(file, filename, tags)
@@ -356,18 +374,26 @@ class AzureStorageProvider(StorageProvider):
         LocalStorageProvider.delete_all_files()
 
 
-def get_storage_provider(storage_provider: str):
+def get_storage_provider(storage_provider: str = STORAGE_PROVIDER):
     if storage_provider == "local":
-        Storage = LocalStorageProvider()
+        storage = LocalStorageProvider()
     elif storage_provider == "s3":
-        Storage = S3StorageProvider()
+        storage = S3StorageProvider()
     elif storage_provider == "gcs":
-        Storage = GCSStorageProvider()
+        storage = GCSStorageProvider()
     elif storage_provider == "azure":
-        Storage = AzureStorageProvider()
+        storage = AzureStorageProvider()
     else:
         raise RuntimeError(f"Unsupported storage provider: {storage_provider}")
-    return Storage
+    return storage
 
 
-Storage = get_storage_provider(STORAGE_PROVIDER)
+_default_storage = None
+
+
+def get_default_storage() -> StorageProvider:
+    """Return a lazily initialized storage provider based on configuration."""
+    global _default_storage
+    if _default_storage is None:
+        _default_storage = get_storage_provider(STORAGE_PROVIDER)
+    return _default_storage
