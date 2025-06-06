@@ -24,14 +24,12 @@ from open_webui.env import (
 
 from fastapi import (
     Depends,
-    FastAPI,
     File,
     HTTPException,
     Request,
     UploadFile,
     APIRouter,
 )
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, validator
 from starlette.background import BackgroundTask
@@ -54,7 +52,6 @@ from open_webui.config import (
     UPLOAD_DIR,
 )
 from open_webui.env import (
-    ENV,
     SRC_LOG_LEVELS,
     AIOHTTP_CLIENT_SESSION_SSL,
     AIOHTTP_CLIENT_TIMEOUT,
@@ -1721,7 +1718,6 @@ async def upload_model(
     with open(file_path, "wb") as out_f:
         while True:
             chunk = file.file.read(chunk_size)
-            # log.info(f"Chunk: {str(chunk)}") # DEBUG
             if not chunk:
                 break
             out_f.write(chunk)
@@ -1748,50 +1744,83 @@ async def upload_model(
                     yield f"data: {json.dumps(data_msg)}\n\n"
 
             # --- P3: Upload to ollama /api/blobs ---
-            with open(file_path, "rb") as f:
+            progress_queue = asyncio.Queue()
+
+            async def upload_gen():
+                bytes_sent = 0
+                with open(file_path, "rb") as f:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        bytes_sent += len(chunk)
+                        await progress_queue.put(
+                            {
+                                "progress": round(bytes_sent / total_size * 100, 2),
+                                "total": total_size,
+                                "completed": bytes_sent,
+                            }
+                        )
+                        yield chunk
+
+            async def upload_to_ollama():
                 url = f"{ollama_url}/api/blobs/sha256:{file_hash}"
-                response = requests.post(url, data=f)
+                timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+                async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                    async with session.post(
+                        url, data=upload_gen(), ssl=AIOHTTP_CLIENT_SESSION_SSL
+                    ) as r:
+                        r.raise_for_status()
 
-            if response.ok:
-                log.info(f"Uploaded to /api/blobs")  # DEBUG
-                # Remove local file
-                os.remove(file_path)
+            upload_task = asyncio.create_task(upload_to_ollama())
 
-                # Create model in ollama
-                model_name, ext = os.path.splitext(filename)
-                log.info(f"Created Model: {model_name}")  # DEBUG
+            while True:
+                if upload_task.done() and progress_queue.empty():
+                    break
+                try:
+                    msg = await asyncio.wait_for(progress_queue.get(), 0.1)
+                    yield f"data: {json.dumps(msg)}\n\n"
+                except asyncio.TimeoutError:
+                    continue
 
-                create_payload = {
-                    "model": model_name,
-                    # Reference the file by its original name => the uploaded blob's digest
-                    "files": {filename: f"sha256:{file_hash}"},
+            await upload_task
+
+            log.info("Uploaded to /api/blobs")  # DEBUG
+            # Remove local file
+            os.remove(file_path)
+
+            # Create model in ollama
+            model_name, ext = os.path.splitext(filename)
+            log.info(f"Created Model: {model_name}")  # DEBUG
+
+            create_payload = {
+                "model": model_name,
+                # Reference the file by its original name => the uploaded blob's digest
+                "files": {filename: f"sha256:{file_hash}"},
+            }
+            log.info(f"Model Payload: {create_payload}")  # DEBUG
+
+            # Call ollama /api/create
+            # https://github.com/ollama/ollama/blob/main/docs/api.md#create-a-model
+            create_resp = requests.post(
+                url=f"{ollama_url}/api/create",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(create_payload),
+            )
+
+            if create_resp.ok:
+                log.info("API SUCCESS!")  # DEBUG
+                done_msg = {
+                    "done": True,
+                    "blob": f"sha256:{file_hash}",
+                    "name": filename,
+                    "model_created": model_name,
                 }
-                log.info(f"Model Payload: {create_payload}")  # DEBUG
-
-                # Call ollama /api/create
-                # https://github.com/ollama/ollama/blob/main/docs/api.md#create-a-model
-                create_resp = requests.post(
-                    url=f"{ollama_url}/api/create",
-                    headers={"Content-Type": "application/json"},
-                    data=json.dumps(create_payload),
-                )
-
-                if create_resp.ok:
-                    log.info(f"API SUCCESS!")  # DEBUG
-                    done_msg = {
-                        "done": True,
-                        "blob": f"sha256:{file_hash}",
-                        "name": filename,
-                        "model_created": model_name,
-                    }
-                    yield f"data: {json.dumps(done_msg)}\n\n"
-                else:
-                    raise Exception(
-                        f"Failed to create model in Ollama. {create_resp.text}"
-                    )
-
+                yield f"data: {json.dumps(done_msg)}\n\n"
             else:
-                raise Exception("Ollama: Could not create blob, Please try again.")
+                raise Exception(
+                    f"Failed to create model in Ollama. {create_resp.text}"
+                )
 
         except Exception as e:
             res = {"error": str(e)}
